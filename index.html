@@ -336,6 +336,56 @@
   var SUPABASE_URL = 'https://pdqywwxyibnapeytoalk.supabase.co';
   var SUPABASE_KEY = 'sb_publishable_gAk4DGF0YlBxFQkcO92reQ_cb9H91lQ';
   var REST = SUPABASE_URL + '/rest/v1';
+
+  // ---------- CRM link (shared spine: crm_companies / crm_contacts) ----------
+  var CRM_URL = 'https://cobaltcommercialcredit.github.io/cobalt-crm/';
+  function crmNorm(s){ return (s||'').toLowerCase().replace(/\b(inc|llc|ltd|corp|corporation|co|company|the)\b/g,'').replace(/[^a-z0-9]/g,''); }
+  function crmUid(p){ return p+':'+Date.now()+Math.random().toString(36).slice(2,7); }
+  function crmOpen(companyId){ window.open(CRM_URL+'?company='+encodeURIComponent(companyId), '_blank'); }
+  async function crmReq(method, path, body){
+    var res = await fetch(REST+path, { method:method, headers: sbHeaders(method==='GET'?{}:{ 'Prefer':'return=minimal' }), body: body?JSON.stringify(body):undefined });
+    if(!res.ok){ var t=''; try{ t=await res.text(); }catch(e){} throw new Error('CRM '+method+' failed '+res.status+' '+t.slice(0,120)); }
+    if(method!=='GET') return null;
+    return await res.json();
+  }
+  // Finds the company by name or the person by email/phone; creates whatever is missing. Returns ids.
+  async function crmEnsure(o){
+    var by = (state.session && state.session.email) || 'Unknown';
+    var key = crmNorm(o.name), email = (o.email||'').trim().toLowerCase(), phone = (o.phone||'').replace(/\D/g,'').slice(-10);
+    var companies = await crmReq('GET', '/crm_companies?select=id,name');
+    var co = null, ct = null;
+    if(email && /@/.test(email)){
+      var hits = await crmReq('GET', '/crm_contacts?select=id,company_id,email&email=ilike.'+encodeURIComponent(email));
+      if(hits && hits.length){ ct = hits[0]; if(ct.company_id) co = { id: ct.company_id }; }
+    }
+    if(!co && key){ for(var i=0;i<companies.length;i++){ if(crmNorm(companies[i].name)===key){ co = companies[i]; break; } } }
+    var createdCo = false;
+    if(!co){
+      co = { id: crmUid('co'), name: o.name || o.contactName || 'Unnamed', industry: o.industry||'', address: o.address||'', status: o.status||'Qualified',
+        owner: o.owner||'', source: o.source||'', linked_prospect_id: o.linkedProspectId||null, dedupe_key: key, created_by: by };
+      await crmReq('POST', '/crm_companies', [co]); createdCo = true;
+    }
+    if(!ct && (o.contactName || email || phone)){
+      if(!createdCo){
+        var people = await crmReq('GET', '/crm_contacts?select=id,first_name,last_name,phone,email&company_id=eq.'+encodeURIComponent(co.id));
+        var cn = (o.contactName||'').trim().toLowerCase();
+        for(var j=0;j<(people||[]).length;j++){
+          var p = people[j], full = ((p.first_name||'')+' '+(p.last_name||'')).trim().toLowerCase();
+          if((cn && full===cn) || (phone && (p.phone||'').replace(/\D/g,'').slice(-10)===phone)){ ct = p; break; }
+        }
+      }
+      if(!ct){
+        var nm = (o.contactName||'').replace(/,.*$/,'').trim().split(/\s+/);
+        ct = { id: crmUid('ct'), company_id: co.id, first_name: nm[0]||'', last_name: nm.slice(1).join(' '), email: /@/.test(email)?o.email.trim():'', phone: o.phone||'',
+          roles: o.roles||['Owner'], is_primary: createdCo, status: o.status||'Qualified', owner: o.owner||'', source: o.source||'', referral_partner_id: o.referralPartnerId||null,
+          dedupe_key: /@/.test(email)?email:null, created_by: by };
+        await crmReq('POST', '/crm_contacts', [ct]);
+      }
+    }
+    if(o.referralPartnerId && ct) await crmReq('PATCH', '/crm_contacts?id=eq.'+encodeURIComponent(ct.id), { referral_partner_id: o.referralPartnerId });
+    await crmReq('POST', '/crm_activities', [{ id: crmUid('act'), company_id: co.id, contact_id: ct?ct.id:null, type:'System', body: o.note || 'Linked from another Cobalt tool', owner: o.owner||'', created_by: by }]);
+    return { companyId: co.id, contactId: ct?ct.id:null, created: createdCo };
+  }
   var AUTH = SUPABASE_URL + '/auth/v1';
 
   function sbHeaders(extra){
@@ -394,7 +444,7 @@
       rate: row.indicative_rate, turnaround: row.typical_turnaround_days, maxLeverage: row.max_leverage, minDSCR: row.min_dscr,
       situationsAccepted: row.situations_accepted||[], sbaPLP: row.sba_plp, bkTolerance: row.bk_tolerance,
       contactName: row.contact_name, phone: row.phone, email: row.email, notesLog: row.notes_log||[], createdAt: row.created_at,
-      updatedAt: row.updated_at
+      updatedAt: row.updated_at, crmCompanyId: row.crm_company_id || null
     };
   }
   async function checkForConflict(id, knownUpdatedAt){
@@ -415,6 +465,14 @@
     if(!records.length) return;
     var res = await fetch(REST+'/bank_matrix', { method:'POST', headers: sbHeaders({ 'Prefer':'resolution=merge-duplicates,return=minimal' }), body: JSON.stringify(records.map(toDbRow)) });
     if(!res.ok) throw new Error('upsert failed');
+  }
+
+  async function linkBankToCrm(rec){
+    var r = await crmEnsure({ name: rec.bankName, contactName: (rec.contactName||'').split(',')[0], phone: rec.phone, email: rec.email, owner: rec.assignedTo,
+      source: 'Bank', status: rec.status==='Active' ? 'Partner' : 'Working', roles: ['Lender'], note: 'Linked from Bank Matrix' });
+    await patchBankRemote(rec.id, { crm_company_id: r.companyId });
+    rec.crmCompanyId = r.companyId;
+    return r;
   }
   async function patchBankRemote(id, fields){
     var res = await fetch(REST+'/bank_matrix?id=eq.'+encodeURIComponent(id), { method:'PATCH', headers: sbHeaders({ 'Prefer':'return=minimal' }), body: JSON.stringify(fields) });
@@ -635,8 +693,11 @@
     state.banks.push(rec);
     $('addOverlay').style.display = 'none';
     renderAll();
-    try{ await upsertBanksRemote([rec]); toast('Bank added'); }
-    catch(e){ toast('Added locally, but syncing failed — check your connection'); }
+    try{ await upsertBanksRemote([rec]); }
+    catch(e){ toast('Added locally, but syncing failed — check your connection'); return; }
+    // Every new bank also exists in the CRM, so its people and email history have a home.
+    try{ await linkBankToCrm(rec); toast('Bank added and linked in the CRM'); renderTable(); }
+    catch(e){ toast('Bank added. CRM link failed: '+e.message+'. Use Add to CRM in its details.'); }
   });
 
   // ---------- backups ----------
@@ -795,7 +856,7 @@
       var loanRange = (b.minLoan!=null || b.maxLoan!=null) ? (fmtMoney(b.minLoan)+' – '+fmtMoney(b.maxLoan)) : '—';
       html += '<tr data-id="'+b.id+'">';
       html += '<td><input type="checkbox" class="row-select" data-act="select"'+(state.selected[b.id]?' checked':'')+'></td>';
-      html += '<td><div class="bank-name" data-act="expandname">'+esc(b.bankName)+'</div>'+(b.linkedPartnerName?'<div class="badge linked">🔗 '+esc(b.linkedPartnerName)+'</div>':'')+'</td>';
+      html += '<td><div class="bank-name" data-act="expandname">'+esc(b.bankName)+'</div>'+(b.crmCompanyId?'<div class="badge linked" data-act="opencrm" style="cursor:pointer;" title="Open this bank in the CRM">CRM ↗</div>':'')+(b.linkedPartnerName?'<div class="badge linked">🔗 '+esc(b.linkedPartnerName)+'</div>':'')+'</td>';
       html += '<td><select class="status-select '+stClass+'" data-act="status">'+STATUSES.map(function(s){ return '<option'+(s===b.status?' selected':'')+'>'+s+'</option>'; }).join('')+'</select></td>';
       html += '<td>'+((b.instrumentTypes||[]).length ? b.instrumentTypes.map(function(i){ return '<span class="badge instr">'+esc(i)+'</span>'; }).join('') : '<span style="color:var(--ink-faint);">—</span>')+'</td>';
       html += '<td>'+renderFeeSummaryHtml(b)+'</td>';
@@ -837,6 +898,7 @@
 
   function renderDetailHtml(b){
     return ''
+      +'<div class="detail-section" style="display:flex;gap:8px;align-items:center;">'+(b.crmCompanyId?'<button class="btn" data-act="opencrm">Open in CRM</button><span style="font-size:12px;color:var(--ink-faint);">Relationship, people, and email history live in the CRM.</span>':'<button class="btn btn-primary" data-act="addcrm">Add to CRM</button><span style="font-size:12px;color:var(--ink-faint);">Creates or links this bank and its contact in the CRM.</span>')+'</div>'
       +'<div class="detail-section"><h4>Bank name</h4><div class="detail-grid">'
         +'<div style="grid-column:span 4;"><label>Name</label><input type="text" data-act="bankNameEdit" value="'+esc(b.bankName||'')+'"></div>'
       +'</div></div>'
@@ -959,6 +1021,13 @@
       var expandNameEl = tr.querySelector('[data-act="expandname"]');
       if(expandNameEl) expandNameEl.addEventListener('click', toggleExpand);
 
+      Array.prototype.forEach.call(tr.querySelectorAll('[data-act="opencrm"]'), function(btn){ btn.addEventListener('click', function(e){ e.stopPropagation(); crmOpen(rec.crmCompanyId); }); });
+      var addCrmBtn = tr.querySelector('[data-act="addcrm"]');
+      if(addCrmBtn) addCrmBtn.addEventListener('click', async function(){
+        addCrmBtn.disabled = true;
+        try{ var r = await linkBankToCrm(rec); toast(r.created ? 'Added to CRM' : 'Linked to the existing CRM record'); renderTable(); }
+        catch(e){ addCrmBtn.disabled = false; toast('CRM link failed: '+e.message); }
+      });
       var delBtn = tr.querySelector('[data-act="delete"]');
       if(delBtn) delBtn.addEventListener('click', async function(){
         if(!confirm('Delete '+rec.bankName+' for everyone?')) return;
