@@ -469,7 +469,7 @@
 
   async function linkBankToCrm(rec){
     var r = await crmEnsure({ name: rec.bankName, contactName: (rec.contactName||'').split(',')[0], phone: rec.phone, email: rec.email, owner: rec.assignedTo,
-      source: 'Bank', status: rec.status==='Active' ? 'Partner' : 'Working', roles: ['Lender'], note: 'Linked from Bank Matrix' });
+      status: rec.status==='Active' ? 'Partner' : 'Working', roles: ['Lender'], note: 'Linked from Bank Matrix' });
     await patchBankRemote(rec.id, { crm_company_id: r.companyId });
     try{ await crmReq('PATCH', '/crm_companies?id=eq.'+encodeURIComponent(r.companyId), { kind:'lender' }); }catch(e){}
     rec.crmCompanyId = r.companyId;
