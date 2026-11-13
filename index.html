@@ -1231,7 +1231,16 @@
     $('tableWrap').innerHTML = '<div class="empty"><div class="display">Loading…</div><p>Connecting to the database.</p></div>';
     try{ state.banks = await fetchAllBanks(); }
     catch(e){ toast('Could not connect to the database — check your connection and refresh'); }
+    // Link from the CRM: ?bank=ID opens that bank's full credit box.
+    var want = new URLSearchParams(location.search).get('bank');
+    if(want && state.banks.some(function(x){ return x.id===want; })) state.expanded[want] = true;
     renderAll();
+    if(want && state.expanded[want]){
+      setTimeout(function(){
+        var row = document.querySelector('tr[data-id="'+want.replace(/"/g,'')+'"]');
+        if(row){ row.scrollIntoView({ block:'center' }); row.style.transition='background 1.5s'; row.style.background='#eef3fb'; setTimeout(function(){ row.style.background=''; }, 2000); }
+      }, 100);
+    }
   }
   async function enterApp(){
     $('authGate').style.display = 'none';
